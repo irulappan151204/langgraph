@@ -112,8 +112,10 @@ class ProtocolSseTransport:
         done: asyncio.Future[BaseException | None] = loop.create_future()
         queue: asyncio.Queue[Event | None] = asyncio.Queue(maxsize=self._max_queue_size)
         cancel_event = asyncio.Event()
+        stream_ended = False
 
         async def pump() -> None:
+            nonlocal stream_ended
             try:
                 # Merge default headers first so fixed SSE headers always win.
                 sse_headers = {
@@ -161,9 +163,14 @@ class ProtocolSseTransport:
                 if not done.done():
                     done.set_result(err)
             finally:
+                stream_ended = True
                 if not done.done():
                     done.set_result(None)
-                await queue.put(None)  # sentinel: end of stream
+                # Wake an empty-queue consumer without blocking shutdown on a
+                # full queue. Keep terminal state separate from the public done
+                # future, which callers may cancel while the stream is active.
+                with contextlib.suppress(asyncio.QueueFull):
+                    queue.put_nowait(None)
 
         task = asyncio.create_task(pump())
         self._event_streams.add(task)
@@ -171,6 +178,8 @@ class ProtocolSseTransport:
 
         async def aiter() -> AsyncIterator[Event]:
             while True:
+                if cancel_event.is_set() or (stream_ended and queue.empty()):
+                    return
                 item = await queue.get()
                 if item is None or cancel_event.is_set():
                     return
@@ -179,7 +188,8 @@ class ProtocolSseTransport:
         async def close() -> None:
             cancel_event.set()
             # Why: pump may be mid-`finally`; ensure consumer unblocks.
-            queue.put_nowait(None)
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(None)
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task

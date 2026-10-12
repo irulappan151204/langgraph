@@ -60,6 +60,8 @@ async for chunk in client.runs.stream(
 
 `client.threads.stream()` returns a context manager that owns the SSE session for one thread. Typed projections — values snapshots, message streams, tool calls, custom events — all share the same underlying connection.
 
+The async SSE transport uses a bounded event queue to apply backpressure to slow consumers. Closing a stream does not require an active consumer or a free queue slot. Closing an individual event-stream handle stops further delivery; closing the transport allows already buffered events to drain. At EOF or on a stream error, buffered events remain available and iteration terminates after they have been consumed.
+
 ```python
 from langgraph_sdk import get_client
 import asyncio
@@ -92,6 +94,25 @@ async with client.threads.stream(
 See our [Releases](https://docs.langchain.com/oss/python/release-policy) and [Versioning](https://docs.langchain.com/oss/python/versioning) policies.
 
 ## 💁 Contributing
+
+### Reproducible local development
+
+From a checkout of this repository, install the SDK's locked development environment:
+
+```bash
+cd libs/sdk-py
+uv sync --frozen
+uv run --frozen pytest tests
+uv run --frozen ruff check .
+uv run --frozen ruff format . --check
+uv run --frozen ty check .
+```
+
+The default tests exclude integration tests and need no API key, model download, GPU, or running server. Integration tests require a LangGraph API server at `http://localhost:2024`; opt in with `uv run --frozen pytest tests -m integration`. Configure credentials for authenticated servers through your environment, and never commit them.
+
+The async SSE shutdown regression tests are in `tests/streaming/test_transport_http.py`. They cover saturated queues during handle close, transport close, EOF, and stream errors, including response cleanup and buffered-event delivery. Run them with `uv run --frozen pytest tests/streaming/test_transport_http.py`.
+
+When `make` is available, use the repository's `make format`, `make lint`, and `make test` targets before submitting a contribution.
 
 As an open-source project in a rapidly developing field, we are extremely open to contributions, whether it be in the form of a new feature, improved infrastructure, or better documentation.
 

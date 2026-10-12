@@ -537,3 +537,139 @@ async def test_open_event_stream_done_records_post_ready_error():
     assert received == [values_event(seq=1)]
     assert isinstance(err, RuntimeError)
     assert "scripted async stream failure" in str(err)
+
+
+@pytest.mark.parametrize("close_transport", [False, True])
+@pytest.mark.parametrize("queue_size", [1, 2])
+async def test_close_event_stream_with_full_queue(close_transport, queue_size):
+    """Closing a backpressured stream must not require an active consumer."""
+    backpressured = asyncio.Event()
+    response_closed = asyncio.Event()
+    expected = [values_event(seq=i) for i in range(queue_size)]
+
+    class FullStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for i in range(queue_size + 1):
+                if i == queue_size:
+                    backpressured.set()
+                yield b"data: " + orjson.dumps(values_event(seq=i)) + b"\n\n"
+
+        async def aclose(self):
+            response_closed.set()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=FullStream())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        transport = ProtocolSseTransport(
+            client=client, thread_id="t-1", max_queue_size=queue_size
+        )
+        handle = transport.open_event_stream({"channels": ["values"]})
+        try:
+            await asyncio.wait_for(handle.ready, timeout=1.0)
+            await asyncio.wait_for(backpressured.wait(), timeout=1.0)
+            closer = transport.close if close_transport else handle.close
+            close_task = asyncio.ensure_future(closer())
+            try:
+                finished, _ = await asyncio.wait({close_task}, timeout=1.0)
+                assert finished, "close must finish without draining the queue"
+                await close_task
+            finally:
+                close_task.cancel()
+                await asyncio.gather(close_task, return_exceptions=True)
+            assert response_closed.is_set()
+            assert isinstance(handle.done.result(), asyncio.CancelledError)
+
+            async def drain():
+                return [event async for event in handle.events]
+
+            received = await asyncio.wait_for(drain(), timeout=1.0)
+            assert received == (expected if close_transport else [])
+            # Repeated close must also terminate without an active consumer.
+            await asyncio.wait_for(closer(), timeout=1.0)
+        finally:
+            # A broken close can leave the pump blocked in its own finally block.
+            tasks = list(transport._event_streams)
+            for task in tasks:
+                task.cancel()
+            await asyncio.sleep(0)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("stream_error", [False, True])
+@pytest.mark.parametrize("queue_size", [1, 2])
+async def test_full_queue_preserves_events_at_stream_end(stream_error, queue_size):
+    """EOF and errors finish the pump even when its last event fills the queue."""
+    source_finished = asyncio.Event()
+    expected = [values_event(seq=i) for i in range(queue_size)]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        async def body():
+            for event in expected:
+                yield b"data: " + orjson.dumps(event) + b"\n\n"
+            source_finished.set()
+            if stream_error:
+                raise RuntimeError("scripted end-of-stream error")
+
+        return httpx.Response(200, content=body())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        transport = ProtocolSseTransport(
+            client=client, thread_id="t-1", max_queue_size=queue_size
+        )
+        handle = transport.open_event_stream({"channels": ["values"]})
+        try:
+            await asyncio.wait_for(handle.ready, timeout=1.0)
+            await asyncio.wait_for(source_finished.wait(), timeout=1.0)
+            assert all(task.done() for task in transport._event_streams)
+            error = handle.done.result()
+            if stream_error:
+                assert isinstance(error, RuntimeError)
+                assert str(error) == "scripted end-of-stream error"
+            else:
+                assert error is None
+
+            async def drain():
+                return [event async for event in handle.events]
+
+            assert await asyncio.wait_for(drain(), timeout=1.0) == expected
+        finally:
+            await asyncio.wait_for(transport.close(), timeout=1.0)
+
+
+async def test_cancelled_done_future_does_not_end_active_stream():
+    """A caller timing out on done must not terminate event delivery."""
+    emit = asyncio.Event()
+    expected = values_event(seq=0)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        async def body():
+            await emit.wait()
+            yield b"data: " + orjson.dumps(expected) + b"\n\n"
+
+        return httpx.Response(200, content=body())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        transport = ProtocolSseTransport(client=client, thread_id="t-1")
+        handle = transport.open_event_stream({"channels": ["values"]})
+        try:
+            await asyncio.wait_for(handle.ready, timeout=1.0)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(handle.done, timeout=0.01)
+            assert handle.done.cancelled()
+            next_event = asyncio.ensure_future(anext(handle.events))
+            await asyncio.sleep(0)
+            emit.set()
+            assert await asyncio.wait_for(next_event, timeout=1.0) == expected
+            with pytest.raises(StopAsyncIteration):
+                await asyncio.wait_for(anext(handle.events), timeout=1.0)
+        finally:
+            await asyncio.wait_for(handle.close(), timeout=1.0)
