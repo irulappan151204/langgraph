@@ -662,7 +662,7 @@ async def test_cancelled_done_future_does_not_end_active_stream():
         handle = transport.open_event_stream({"channels": ["values"]})
         try:
             await asyncio.wait_for(handle.ready, timeout=1.0)
-            with pytest.raises(TimeoutError):
+            with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(handle.done, timeout=0.01)
             assert handle.done.cancelled()
             next_event = asyncio.ensure_future(anext(handle.events))
